@@ -12,6 +12,8 @@ Codex user hooks -> lightweight JSONL event logger -> local watchdog
 
 Hooks only record lifecycle events. The watchdog checks open commands at a low frequency, combines timing, log freshness, process, CPU, GPU, stderr, and Codex task state, and escalates only when configured thresholds are met.
 
+Only non-empty `Bash` calls become timeout candidates. A `Stop` event records turn state but does not close a command; a matching `PostToolUse` event or explicit transcript completion evidence closes it. The transcript matcher also understands `function_call` and `custom_tool_call` records used by newer unified execution paths.
+
 ## Highlights
 
 - Four user-level hooks: `SessionStart`, `PreToolUse`, `PostToolUse`, and `Stop`.
@@ -19,6 +21,7 @@ Hooks only record lifecycle events. The watchdog checks open commands at a low f
 - 10-minute multi-signal detection plus a 20-minute hard-timeout review threshold.
 - Three operating modes: local observation, guardian notification, and guardian-gated interruption.
 - Per-day JSONL logs with retention for event and alert files.
+- Bounded Codex app-server inspection, cached task labels, and alert-fingerprint deduplication.
 - User-level Windows shortcuts, startup recovery task, and reversible integration removal.
 - Existing unrelated Codex hooks are preserved when this project adds or removes its own definitions.
 
@@ -87,6 +90,7 @@ Use interruption only after validating the guardian flow:
 - `remove-hooks.ps1` stops monitoring and removes only this project's four hook groups.
 - `install-windows-integration.ps1` adds one desktop/Start Menu management entry and a user-logon recovery task.
 - `remove-windows-integration.ps1` removes that Windows shell integration without deleting runtime state or Codex hooks.
+- The management entry opens this README as the portable user guide.
 
 ## Tests
 

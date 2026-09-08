@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -23,18 +24,23 @@ from codex_hooks_monitor.common import (
     user_popup_enabled,
     utc_now,
 )
-from codex_hooks_monitor.app_server_client import AppServerError
+from codex_hooks_monitor.app_server_client import AppServerError, CodexAppServerClient
 from codex_hooks_monitor.watchdog import (
     classify_runtime,
+    cached_thread_snapshot,
     extract_json_object,
     find_matching_transcript_call,
     is_terminal_turn_snapshot,
     load_state,
+    mark_alert_recorded,
     maybe_emit_user_popup,
     maybe_interrupt_target,
     maybe_send_guardian_alert,
+    prune_unmonitorable_open_commands,
     reduce_events,
+    run_once,
     scan_new_events,
+    should_record_alert,
 )
 
 
@@ -81,7 +87,7 @@ class RecordingGuardianClient:
 
 def run_logger(runtime_root: Path, payload: dict[str, object]) -> None:
     subprocess.run(
-        [r"C:\ProgramData\anaconda3\python.exe", str(SRC / "codex_hooks_monitor" / "hook_logger.py"), "--runtime-root", str(runtime_root)],
+        [sys.executable, str(SRC / "codex_hooks_monitor" / "hook_logger.py"), "--runtime-root", str(runtime_root)],
         input=json.dumps(payload, ensure_ascii=False),
         text=True,
         check=True,
@@ -144,6 +150,18 @@ def main() -> int:
             temp_root,
             {
                 **base_payload,
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-unmonitorable",
+                "turn_id": "turn-unmonitorable",
+                "tool_name": "apply_patch",
+                "tool_use_id": "tool-unmonitorable",
+                "tool_input": {"patch": "*** Begin Patch"},
+            },
+        )
+        run_logger(
+            temp_root,
+            {
+                **base_payload,
                 "hook_event_name": "Stop",
                 "session_id": "thread-b",
                 "turn_id": "turn-b",
@@ -153,10 +171,60 @@ def main() -> int:
         state = load_state(layout)
         events = scan_new_events(layout, state)
         reduce_events(state, events)
-        if len(events) != 4:
-            raise AssertionError(f"expected 4 events, got {len(events)}")
+        if len(events) != 5:
+            raise AssertionError(f"expected 5 events, got {len(events)}")
         if state.get("open_commands"):
             raise AssertionError(f"expected no open commands, got {state['open_commands']}")
+        state["open_commands"]["legacy-unmonitorable"] = {"tool_name": "apply_patch", "command": ""}
+        state["alerts"]["legacy-unmonitorable"] = {"fingerprint": "legacy"}
+        if prune_unmonitorable_open_commands(state) != 1:
+            raise AssertionError("expected one legacy unmonitorable item to be pruned")
+        if "legacy-unmonitorable" in state["alerts"]:
+            raise AssertionError("expected matching legacy alert state to be pruned")
+
+        stop_now = utc_now()
+        stop_state = {"open_commands": {}, "alerts": {}}
+        stop_events = [
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-stop",
+                "turn_id": "turn-stop",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-stop",
+                "tool_input_command": "Start-Sleep -Seconds 60",
+                "observed_at": stop_now.isoformat(),
+            },
+            {
+                "hook_event_name": "Stop",
+                "session_id": "thread-stop",
+                "turn_id": "turn-stop",
+                "observed_at": stop_now.isoformat(),
+            },
+        ]
+        reduce_events(stop_state, stop_events)
+        stopped_key = "thread-stop|turn-stop|tool-stop|Bash"
+        stopped_item = stop_state["open_commands"].get(stopped_key)
+        if not stopped_item or not stopped_item.get("turn_stopped_at"):
+            raise AssertionError("Stop must retain an unclosed shell command for background execution")
+
+        cached_snapshot = cached_thread_snapshot(
+            {
+                "session_thread_cache": {"thread-cached": "thread-id-cached"},
+                "session_thread_name_cache": {"thread-cached": "Cached Thread Name"},
+            },
+            {"session_id": "thread-cached", "command": "Start-Sleep -Seconds 60"},
+        )
+        if cached_snapshot["thread_id"] != "thread-id-cached" or cached_snapshot["thread_name"] != "Cached Thread Name":
+            raise AssertionError(f"expected cached thread label, got {cached_snapshot}")
+
+        alert_state = {"alerts": {}}
+        alert_item = {"key": "thread-alert|turn-alert|tool-alert|Bash", "command": "Start-Sleep -Seconds 60"}
+        alert_analysis = {"level": "hard_timeout_review", "signals": ["runtime_exceeded"]}
+        if not should_record_alert(alert_state, alert_item, alert_analysis):
+            raise AssertionError("expected first alert record")
+        mark_alert_recorded(alert_state, alert_item, alert_analysis)
+        if should_record_alert(alert_state, alert_item, alert_analysis):
+            raise AssertionError("expected duplicate alert record to be suppressed")
 
         now = utc_now()
         thresholds = load_settings(layout)
@@ -225,6 +293,7 @@ def main() -> int:
         if hard_timeout["level"] != "hard_timeout_review":
             raise AssertionError(f"expected hard_timeout_review, got {hard_timeout}")
 
+        demo_command = "powershell -NoProfile -Command Start-Sleep"
         transcript_fixture = temp_root / "function-call-rollout.jsonl"
         transcript_fixture.write_text(
             "\n".join(
@@ -236,7 +305,7 @@ def main() -> int:
                                 "type": "function_call",
                                 "name": "shell_command",
                                 "call_id": "call-demo",
-                                "arguments": json.dumps({"command": "powershell -ExecutionPolicy Bypass -File D:\\demo\\long.ps1"}),
+                                "arguments": json.dumps({"command": demo_command}),
                             },
                         },
                         ensure_ascii=False,
@@ -247,7 +316,30 @@ def main() -> int:
                             "payload": {
                                 "type": "function_call_output",
                                 "call_id": "call-demo",
-                                "output": "Exit code: 0",
+                                "output": "Process running with session ID 12345",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "item_completed",
+                                "item": {
+                                    "type": "CommandExecution",
+                                    "id": "call-demo",
+                                    "process_id": "12345",
+                                    "command": [
+                                        "powershell",
+                                        "-NoProfile",
+                                        "-Command",
+                                        "Start-Sleep",
+                                    ],
+                                    "status": "completed",
+                                    "stdout": "Exit code: 0",
+                                    "stderr": "",
+                                },
                             },
                         },
                         ensure_ascii=False,
@@ -258,10 +350,87 @@ def main() -> int:
         )
         transcript_match = find_matching_transcript_call(
             str(transcript_fixture),
-            {"command": "powershell -ExecutionPolicy Bypass -File D:\\demo\\long.ps1"},
+            {"command": demo_command},
         )
         if not transcript_match or transcript_match.get("status") != "completed":
             raise AssertionError(f"expected completed transcript match, got {transcript_match}")
+        if not is_terminal_turn_snapshot(transcript_match):
+            raise AssertionError(f"expected completion evidence, got {transcript_match}")
+
+        custom_transcript_fixture = temp_root / "custom-tool-rollout.jsonl"
+        custom_command = "powershell -NoProfile -Command \"Start-Sleep -Seconds 45\""
+        custom_tool_input = f"const r = await tools.exec_command({json.dumps({'cmd': custom_command})});"
+        custom_transcript_fixture.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "custom_tool_call",
+                                "name": "exec",
+                                "call_id": "call-wrapper",
+                                "input": custom_tool_input,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "custom_tool_call_output",
+                                "call_id": "call-wrapper",
+                                "output": [{"type": "input_text", "text": "Process running with session ID 54321"}],
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "item_completed",
+                                "item": {
+                                    "type": "CommandExecution",
+                                    "id": "exec-custom",
+                                    "process_id": "54321",
+                                    "command": ["pwsh.exe", "-Command", custom_command],
+                                    "status": "completed",
+                                    "stdout": "done",
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        custom_transcript_match = find_matching_transcript_call(
+            str(custom_transcript_fixture),
+            {"command": custom_command, "tool_use_id": "exec-custom"},
+        )
+        if not custom_transcript_match or not is_terminal_turn_snapshot(custom_transcript_match):
+            raise AssertionError(f"expected custom tool completion match, got {custom_transcript_match}")
+
+        run_logger(
+            temp_root,
+            {
+                **base_payload,
+                "hook_event_name": "PreToolUse",
+                "session_id": "thread-complete",
+                "turn_id": "turn-complete",
+                "tool_name": "Bash",
+                "tool_use_id": "exec-custom",
+                "transcript_path": str(custom_transcript_fixture),
+                "tool_input": {"command": custom_command},
+            },
+        )
+        completion_run = run_once(layout)
+        completion_state = load_state(layout)
+        if any(item.get("session_id") == "thread-complete" for item in completion_state["open_commands"].values()):
+            raise AssertionError(f"completed custom tool remained open: {completion_run}")
 
         local_only = load_settings(layout)
         local_only["actions"]["mode"] = "reserved"
@@ -327,7 +496,7 @@ def main() -> int:
                 "tool_name": "Bash",
                 "command": "ping 127.0.0.1 -n 20",
             },
-            {"thread_id": "thread-c"},
+            {"thread_id": "thread-c", "thread_name": "Smoke Thread"},
             high_conf,
             local_notify,
             notifier=lambda title, message: popup_hits.append((title, message)),
@@ -337,6 +506,9 @@ def main() -> int:
         time.sleep(0.05)
         if not popup_hits:
             raise AssertionError("expected popup notifier to be called")
+        popup_message = popup_hits[0][1]
+        if "线程名称: Smoke Thread" not in popup_message or "线程 ID: thread-c" not in popup_message:
+            raise AssertionError(f"expected popup thread name and ID, got {popup_message!r}")
 
         shared_alert_state = {
             "alerts": {
@@ -379,10 +551,10 @@ def main() -> int:
         preserved = shared_alert_state["alerts"]["thread-c|turn-c|tool-c|Bash"]
         if preserved.get("last_popup_fingerprint") != "preserve-me":
             raise AssertionError(f"guardian delivery erased popup cooldown state: {preserved}")
-        if not is_terminal_turn_snapshot({"turn_status": "completed"}):
-            raise AssertionError("completed turns must be terminal")
-        if is_terminal_turn_snapshot({"turn_status": "in_progress"}):
-            raise AssertionError("in-progress turns must not be terminal")
+        if is_terminal_turn_snapshot({"turn_status": "completed"}):
+            raise AssertionError("turn completion alone must not close a background command")
+        if is_terminal_turn_snapshot({"matched_item_status": "inProgress"}):
+            raise AssertionError("in-progress command evidence must not be terminal")
 
         # Legacy helper verification only. The shipped interrupt flow now goes through guardian JSON.
         interrupt_settings = load_settings(layout)
@@ -467,11 +639,34 @@ def main() -> int:
         if parsed_json != {"decision": "kill", "confidence": "high"}:
             raise AssertionError(f"unexpected parsed_json: {parsed_json}")
 
+        # A silent app-server must honour the caller timeout instead of blocking readline().
+        silent_server = temp_root / "silent-app-server.cmd"
+        silent_server.write_text("@echo off\r\nmore > nul\r\n", encoding="ascii")
+        original_codex_path = os.environ.get("CODEX_CLI_PATH")
+        os.environ["CODEX_CLI_PATH"] = str(silent_server)
+        started = time.monotonic()
+        try:
+            try:
+                CodexAppServerClient(timeout_seconds=1)
+            except AppServerError as exc:
+                if "Timed out waiting" not in str(exc):
+                    raise AssertionError(f"unexpected silent app-server error: {exc}") from exc
+            else:
+                raise AssertionError("silent app-server unexpectedly initialized")
+        finally:
+            if original_codex_path is None:
+                os.environ.pop("CODEX_CLI_PATH", None)
+            else:
+                os.environ["CODEX_CLI_PATH"] = original_codex_path
+        if time.monotonic() - started > 2.5:
+            raise AssertionError("app-server timeout exceeded its bounded wait")
+
         print(
             json.dumps(
                 {
                     "logged_events": len(events),
                     "open_commands_after_reduce": len(state.get("open_commands", {})),
+                    "legacy_unmonitorable_pruned": True,
                     "classify_runtime": {
                         "normal": normal["level"],
                         "suspected": suspected["level"],
@@ -490,6 +685,7 @@ def main() -> int:
                         "guardian_json_parse": parsed_json["decision"],
                         "guardian_error_result": guardian_error["reason"],
                         "transcript_function_call_match": transcript_match["status"],
+                        "app_server_silent_timeout": True,
                     },
                 },
                 ensure_ascii=False,

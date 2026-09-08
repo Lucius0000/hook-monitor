@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = "Stop"
 
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$ManualPath = Join-Path $ProjectRoot "hooks-monitor-使用说明书.md"
+$ManualPath = Join-Path $ProjectRoot "README.md"
 
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)

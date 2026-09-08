@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 
 import psutil
@@ -85,6 +86,27 @@ def make_key(event: dict[str, Any]) -> str:
     )
 
 
+def is_monitorable_command_event(event: dict[str, Any]) -> bool:
+    """Only shell commands have a process lifecycle this watchdog can verify."""
+    return event.get("tool_name") == "Bash" and bool(str(event.get("tool_input_command") or "").strip())
+
+
+def is_monitorable_open_item(item: dict[str, Any]) -> bool:
+    return item.get("tool_name") == "Bash" and bool(str(item.get("command") or "").strip())
+
+
+def prune_unmonitorable_open_commands(state: dict[str, Any]) -> int:
+    open_commands = state.setdefault("open_commands", {})
+    removed = 0
+    for key, item in list(open_commands.items()):
+        if is_monitorable_open_item(item):
+            continue
+        open_commands.pop(key, None)
+        state.setdefault("alerts", {}).pop(key, None)
+        removed += 1
+    return removed
+
+
 def scan_new_events(layout: RuntimeLayout, state: dict[str, Any]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     offsets = state.setdefault("file_offsets", {})
@@ -104,6 +126,11 @@ def reduce_events(state: dict[str, Any], events: list[dict[str, Any]]) -> None:
         name = event.get("hook_event_name")
         if name == "PreToolUse":
             key = make_key(event)
+            if not is_monitorable_command_event(event):
+                # Hooks still retain the event, but non-shell tools have no reliable PID or command lifecycle.
+                open_commands.pop(key, None)
+                state.setdefault("alerts", {}).pop(key, None)
+                continue
             open_commands[key] = {
                 "key": key,
                 "session_id": event.get("session_id"),
@@ -122,13 +149,12 @@ def reduce_events(state: dict[str, Any], events: list[dict[str, Any]]) -> None:
         elif name == "Stop":
             session_id = event.get("session_id")
             turn_id = event.get("turn_id")
-            stale_keys = [
-                key
-                for key, item in open_commands.items()
-                if item.get("session_id") == session_id and item.get("turn_id") == turn_id
-            ]
-            for key in stale_keys:
-                open_commands.pop(key, None)
+            for item in open_commands.values():
+                if item.get("session_id") == session_id and item.get("turn_id") == turn_id:
+                    # A unified exec call can emit Stop before its background commandExecution item completes.
+                    # Keep the shell command open until PostToolUse or explicit command-completion evidence arrives.
+                    item["turn_stopped_at"] = event.get("observed_at")
+                    item["last_event_at"] = event.get("observed_at")
 
 
 def classify_runtime(open_item: dict[str, Any], snapshot: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
@@ -249,6 +275,37 @@ def parse_tool_arguments(raw_arguments: Any) -> dict[str, Any]:
         return {}
 
 
+def normalize_tool_output(output: Any) -> str:
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        return "\n".join(
+            str(item.get("text") or item.get("output") or "") if isinstance(item, dict) else str(item)
+            for item in output
+        )
+    return str(output or "")
+
+
+def normalize_command_text(command: Any) -> str:
+    return str(command or "").replace(r'\"', '"').strip()
+
+
+def extract_command_from_tool_input(raw_input: Any) -> str:
+    arguments = parse_tool_arguments(raw_input)
+    candidate = arguments.get("command") or arguments.get("cmd")
+    if candidate:
+        return str(candidate)
+    if not isinstance(raw_input, str):
+        return ""
+    match = re.search(r'["\'](?:command|cmd)["\']\s*:\s*("(?:\\.|[^"\\])*")', raw_input)
+    if not match:
+        return ""
+    try:
+        return str(json.loads(match.group(1)))
+    except json.JSONDecodeError:
+        return ""
+
+
 def find_matching_transcript_call(transcript_path: str | None, open_item: dict[str, Any]) -> dict[str, Any] | None:
     if not transcript_path:
         return None
@@ -261,7 +318,6 @@ def find_matching_transcript_call(transcript_path: str | None, open_item: dict[s
         return None
 
     matched_call: dict[str, Any] | None = None
-    matched_output: dict[str, Any] | None = None
     try:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
@@ -271,13 +327,39 @@ def find_matching_transcript_call(transcript_path: str | None, open_item: dict[s
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            payload = entry.get("payload", {})
+            if entry.get("type") == "event_msg" and matched_call:
+                if payload.get("type") != "item_completed":
+                    continue
+                item = payload.get("item", {})
+                if item.get("type") != "CommandExecution":
+                    continue
+                expected_ids = {str(matched_call.get("call_id") or ""), str(open_item.get("tool_use_id") or "")}
+                if str(item.get("id") or "") not in expected_ids:
+                    continue
+                command_parts = item.get("command") or []
+                command_text = " ".join(str(part) for part in command_parts)
+                if normalize_command_text(command) not in normalize_command_text(command_text):
+                    continue
+                output = item.get("aggregated_output") or item.get("stdout") or ""
+                matched_call.update(
+                    {
+                        "type": "CommandExecution",
+                        "status": "completed",
+                        "processId": item.get("process_id"),
+                        "aggregatedOutput": output,
+                        "result": {"output": output, "stderr": item.get("stderr") or ""},
+                        "completion_evidence": "transcript_command_execution_completed",
+                    }
+                )
+                continue
             if entry.get("type") != "response_item":
                 continue
-            payload = entry.get("payload", {})
             payload_type = payload.get("type")
             if payload_type in {"function_call", "custom_tool_call"}:
-                arguments = parse_tool_arguments(payload.get("arguments") or payload.get("input"))
-                if arguments.get("command") != command:
+                raw_input = payload.get("arguments") or payload.get("input") or ""
+                candidate_command = extract_command_from_tool_input(raw_input)
+                if normalize_command_text(candidate_command) != normalize_command_text(command):
                     continue
                 matched_call = {
                     "type": payload_type,
@@ -287,15 +369,19 @@ def find_matching_transcript_call(transcript_path: str | None, open_item: dict[s
                     "call_id": payload.get("call_id"),
                     "aggregatedOutput": "",
                     "result": {},
+                    "completion_evidence": "",
                 }
-                matched_output = None
             elif payload_type in {"function_call_output", "custom_tool_call_output"} and matched_call:
                 if payload.get("call_id") != matched_call.get("call_id"):
                     continue
-                matched_output = payload
-                matched_call["status"] = "completed"
-                matched_call["aggregatedOutput"] = payload.get("output") or ""
-                matched_call["result"] = {"output": payload.get("output") or ""}
+                output = normalize_tool_output(payload.get("output"))
+                matched_call["aggregatedOutput"] = output
+                matched_call["result"] = {"output": output}
+                session_match = re.search(r"Process running with session ID\s+(\d+)", output, re.IGNORECASE)
+                if session_match:
+                    # function_call_output is a progress response from unified exec, not completion.
+                    matched_call["status"] = "inProgress"
+                    matched_call["processId"] = session_match.group(1)
     except OSError:
         return None
 
@@ -410,30 +496,65 @@ def resolve_thread_id(client: CodexAppServerClient, state: dict[str, Any], open_
     for thread in data:
         if thread.get("sessionId") == session_id and thread.get("parentThreadId") is None:
             cache[session_id] = thread["id"]
+            thread_name = str(thread.get("name") or "").strip()
+            if thread_name:
+                state.setdefault("session_thread_name_cache", {})[session_id] = thread_name
             return thread["id"]
     return None
 
 
+def cached_thread_snapshot(state: dict[str, Any], open_item: dict[str, Any]) -> dict[str, Any]:
+    snapshot = empty_snapshot(open_item)
+    session_id = open_item.get("session_id")
+    snapshot["thread_id"] = state.get("session_thread_cache", {}).get(session_id) or session_id
+    snapshot["thread_name"] = state.get("session_thread_name_cache", {}).get(session_id, "")
+    return snapshot
+
+
+def resolve_thread_label_bounded(
+    state: dict[str, Any], open_item: dict[str, Any], timeout_seconds: int = 2
+) -> dict[str, Any]:
+    snapshot = cached_thread_snapshot(state, open_item)
+    if snapshot["thread_name"]:
+        return snapshot
+
+    result: Queue[dict[str, Any]] = Queue(maxsize=1)
+    client_ref: list[CodexAppServerClient] = []
+
+    def worker() -> None:
+        try:
+            with CodexAppServerClient(timeout_seconds=timeout_seconds) as client:
+                client_ref.append(client)
+                thread_id = resolve_thread_id(client, state, open_item)
+                if not thread_id:
+                    result.put(snapshot)
+                    return
+                thread = client.thread_read(thread_id, include_turns=False).get("thread", {})
+                thread_name = str(thread.get("name") or "").strip()
+                state.setdefault("session_thread_cache", {})[open_item.get("session_id")] = thread_id
+                if thread_name:
+                    state.setdefault("session_thread_name_cache", {})[open_item.get("session_id")] = thread_name
+                result.put(cached_thread_snapshot(state, open_item))
+        except Exception:
+            result.put(snapshot)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=max(1, timeout_seconds))
+    if thread.is_alive():
+        for client in client_ref:
+            client.close()
+        return snapshot
+    try:
+        return result.get_nowait()
+    except Empty:
+        return snapshot
+
+
 def inspect_candidate(client: CodexAppServerClient, state: dict[str, Any], open_item: dict[str, Any]) -> dict[str, Any]:
+    snapshot = empty_snapshot(open_item)
     thread_id = resolve_thread_id(client, state, open_item)
-    snapshot: dict[str, Any] = {
-        "thread_id": thread_id,
-        "command": open_item.get("command"),
-        "process_id": None,
-        "child_pids": [],
-        "process_alive": None,
-        "cpu_percent": None,
-        "gpu_percent": None,
-        "log_updated_at": "",
-        "log_stale_seconds": None,
-        "thread_status": "",
-        "turn_status": "",
-        "has_error_output": False,
-        "stderr_summary": "",
-        "matched_item_type": "",
-        "thread_lookup_error": "",
-        "log_source": "",
-    }
+    snapshot["thread_id"] = thread_id
     transcript_path = open_item.get("transcript_path")
     if transcript_path:
         path = Path(str(transcript_path))
@@ -451,6 +572,9 @@ def inspect_candidate(client: CodexAppServerClient, state: dict[str, Any], open_
         state.setdefault("session_thread_cache", {}).pop(open_item.get("session_id"), None)
         snapshot["thread_lookup_error"] = str(exc)
         return snapshot
+    snapshot["thread_name"] = str(thread.get("name") or "").strip()
+    if snapshot["thread_name"]:
+        state.setdefault("session_thread_name_cache", {})[open_item.get("session_id")] = snapshot["thread_name"]
     snapshot["thread_status"] = thread.get("status", {}).get("type", "")
     thread_path = thread.get("path")
     if thread_path:
@@ -467,18 +591,82 @@ def inspect_candidate(client: CodexAppServerClient, state: dict[str, Any], open_
         turn = next((item for item in turns if item.get("id") == target_turn_id), turns[-1])
         snapshot["turn_status"] = turn.get("status", "")
         matched = find_matching_item(turn, open_item)
-        if not matched:
-            matched = find_matching_transcript_call(open_item.get("transcript_path"), open_item)
+        transcript_match = find_matching_transcript_call(open_item.get("transcript_path"), open_item)
+        if transcript_match and transcript_match.get("completion_evidence"):
+            # The transcript supplies the completion event for unified exec calls even when the turn ended earlier.
+            matched = transcript_match
+        elif not matched:
+            matched = transcript_match
         if matched:
             snapshot["matched_item_type"] = matched.get("type", "")
+            snapshot["matched_item_status"] = matched.get("status", "")
+            snapshot["completion_evidence"] = matched.get("completion_evidence", "")
             output = matched.get("aggregatedOutput") or json.dumps(matched.get("result"), ensure_ascii=False)
             snapshot["has_error_output"] = any(pattern.search(output or "") for pattern in ERROR_PATTERNS)
             snapshot["stderr_summary"] = shorten_text(output)
-            process_id = matched.get("processId")
+            process_id = matched.get("processId") or matched.get("process_id")
             if process_id is None and matched.get("type") in {"function_call", "custom_tool_call", "functionCall", "customToolCall"}:
                 process_id = find_process_by_command(str(open_item.get("command") or ""), open_item.get("started_at"))
             enrich_process_snapshot(snapshot, process_id)
             snapshot["gpu_percent"] = detect_gpu_percent()
+    return snapshot
+
+
+def empty_snapshot(open_item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "thread_id": None,
+        "thread_name": "",
+        "command": open_item.get("command"),
+        "process_id": None,
+        "child_pids": [],
+        "process_alive": None,
+        "cpu_percent": None,
+        "gpu_percent": None,
+        "log_updated_at": "",
+        "log_stale_seconds": None,
+        "thread_status": "",
+        "turn_status": "",
+        "has_error_output": False,
+        "stderr_summary": "",
+        "matched_item_type": "",
+        "matched_item_status": "",
+        "completion_evidence": "",
+        "thread_lookup_error": "",
+        "log_source": "",
+    }
+
+
+def inspect_candidate_bounded(
+    state: dict[str, Any], open_item: dict[str, Any], timeout_seconds: int
+) -> dict[str, Any]:
+    result: Queue[dict[str, Any]] = Queue(maxsize=1)
+    client_ref: list[CodexAppServerClient] = []
+
+    def worker() -> None:
+        try:
+            with CodexAppServerClient(timeout_seconds=timeout_seconds) as client:
+                client_ref.append(client)
+                result.put({"snapshot": inspect_candidate(client, state, open_item)})
+        except Exception as exc:
+            result.put({"error": repr(exc)})
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=max(1, timeout_seconds))
+    if thread.is_alive():
+        for client in client_ref:
+            client.close()
+        snapshot = empty_snapshot(open_item)
+        snapshot["thread_lookup_error"] = "deep_check_timeout"
+        return snapshot
+    try:
+        payload = result.get_nowait()
+    except Empty:
+        payload = {"error": "deep_check_no_result"}
+    if "snapshot" in payload:
+        return payload["snapshot"]
+    snapshot = empty_snapshot(open_item)
+    snapshot["thread_lookup_error"] = str(payload.get("error") or "deep_check_error")
     return snapshot
 
 
@@ -494,6 +682,17 @@ def alert_hash(open_item: dict[str, Any], analysis: dict[str, Any]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def should_record_alert(state: dict[str, Any], open_item: dict[str, Any], analysis: dict[str, Any]) -> bool:
+    prior = state.setdefault("alerts", {}).get(open_item["key"], {})
+    return prior.get("last_recorded_alert_fingerprint") != alert_hash(open_item, analysis)
+
+
+def mark_alert_recorded(state: dict[str, Any], open_item: dict[str, Any], analysis: dict[str, Any]) -> None:
+    alert_state = state.setdefault("alerts", {}).setdefault(open_item["key"], {})
+    alert_state["last_recorded_alert_fingerprint"] = alert_hash(open_item, analysis)
+    alert_state["last_recorded_alert_at"] = utc_now_iso()
 
 
 def build_guardian_prompt(open_item: dict[str, Any], snapshot: dict[str, Any], analysis: dict[str, Any], settings: dict[str, Any]) -> str:
@@ -522,6 +721,7 @@ def build_guardian_prompt(open_item: dict[str, Any], snapshot: dict[str, Any], a
 
     structured = {
         "target_thread_id": snapshot.get("thread_id") or open_item.get("session_id"),
+        "target_thread_name": snapshot.get("thread_name") or "",
         "target_turn_id": open_item.get("turn_id"),
         "session_id": open_item.get("session_id"),
         "command": open_item.get("command"),
@@ -577,9 +777,12 @@ def build_user_popup_text(open_item: dict[str, Any], snapshot: dict[str, Any], a
     elif analysis.get("level") == "hard_timeout_review":
         action_line = "当前动作：运行时间已超过硬超时阈值，将交由 guardian 做强制复核；默认不自动中止。"
     command = open_item.get("command") or open_item.get("tool_name") or "<unknown>"
+    thread_name = str(snapshot.get("thread_name") or "").strip() or "<未命名或未解析>"
+    thread_id = snapshot.get("thread_id") or open_item.get("session_id") or "<unknown>"
     return (
         "Codex Hooks Monitor 检测到高置信度异常。\n\n"
-        f"线程: {snapshot.get('thread_id') or open_item.get('session_id')}\n"
+        f"线程名称: {thread_name}\n"
+        f"线程 ID: {thread_id}\n"
         f"命令/工具: {command}\n"
         f"判定: {analysis.get('level')}\n"
         f"信号: {', '.join(analysis.get('signals') or [])}\n"
@@ -785,7 +988,7 @@ def maybe_interrupt_target(
 
 
 def maybe_send_guardian_alert(
-    client: CodexAppServerClient,
+    client: CodexAppServerClient | None,
     layout: RuntimeLayout,
     state: dict[str, Any],
     open_item: dict[str, Any],
@@ -811,6 +1014,8 @@ def maybe_send_guardian_alert(
     thread_id = guardian.get("thread_id", "").strip()
     if not thread_id:
         return {"sent": False, "reason": "guardian_thread_missing", "prompt": prompt}
+    if client is None:
+        return {"sent": False, "reason": "guardian_client_unavailable", "prompt": prompt}
 
     action_mode = effective_action_mode(settings)
     try:
@@ -855,14 +1060,50 @@ def maybe_send_guardian_alert(
     return delivery
 
 
+def send_guardian_alert_bounded(
+    layout: RuntimeLayout,
+    state: dict[str, Any],
+    open_item: dict[str, Any],
+    snapshot: dict[str, Any],
+    analysis: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    if not guardian_delivery_enabled(settings):
+        return maybe_send_guardian_alert(None, layout, state, open_item, snapshot, analysis, settings)
+
+    action_mode = effective_action_mode(settings)
+    timeout_seconds = settings["watchdog"]["deep_check_timeout_seconds"]
+    if action_mode == "interrupt":
+        timeout_seconds = settings["guardian"].get("completion_timeout_seconds", timeout_seconds)
+    result: Queue[dict[str, Any]] = Queue(maxsize=1)
+    client_ref: list[CodexAppServerClient] = []
+
+    def worker() -> None:
+        try:
+            with CodexAppServerClient(timeout_seconds=timeout_seconds) as client:
+                client_ref.append(client)
+                result.put(maybe_send_guardian_alert(client, layout, state, open_item, snapshot, analysis, settings))
+        except Exception as exc:
+            result.put({"sent": False, "reason": "guardian_delivery_error", "error": repr(exc)})
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=max(1, timeout_seconds))
+    if thread.is_alive():
+        for client in client_ref:
+            client.close()
+        return {"sent": False, "reason": "guardian_delivery_timeout"}
+    try:
+        return result.get_nowait()
+    except Empty:
+        return {"sent": False, "reason": "guardian_delivery_no_result"}
+
+
 def is_terminal_turn_snapshot(snapshot: dict[str, Any]) -> bool:
-    return str(snapshot.get("turn_status") or "").lower() in {
-        "completed",
-        "failed",
-        "cancelled",
-        "canceled",
-        "interrupted",
-    }
+    return (
+        str(snapshot.get("matched_item_status") or snapshot.get("status") or "").lower() == "completed"
+        and bool(snapshot.get("completion_evidence"))
+    )
 
 
 def prune_runtime(layout: RuntimeLayout, settings: dict[str, Any], state: dict[str, Any]) -> None:
@@ -879,63 +1120,120 @@ def prune_runtime(layout: RuntimeLayout, settings: dict[str, Any], state: dict[s
 def run_once(layout: RuntimeLayout) -> dict[str, Any]:
     settings = load_settings(layout)
     state = load_state(layout)
+    state["last_run_started_at"] = utc_now_iso()
+    state["last_run_stage"] = "scanning_events"
     events = scan_new_events(layout, state)
     reduce_events(state, events)
+    pruned_unmonitorable = prune_unmonitorable_open_commands(state)
     prune_runtime(layout, settings, state)
+    state["last_run_stage"] = "events_reduced"
     save_state(layout, state)
 
-    results = {"processed_events": len(events), "open_commands": len(state.get("open_commands", {})), "alerts": []}
+    results = {
+        "processed_events": len(events),
+        "open_commands": len(state.get("open_commands", {})),
+        "pruned_unmonitorable_open_commands": pruned_unmonitorable,
+        "alerts": [],
+    }
     if not settings.get("enabled", False):
+        state["last_run_stage"] = "disabled"
+        state["last_run_completed_at"] = utc_now_iso()
+        save_state(layout, state)
         return results
 
-    with CodexAppServerClient(timeout_seconds=settings["watchdog"]["deep_check_timeout_seconds"]) as client:
-        for open_item in list(state.get("open_commands", {}).values()):
-            try:
-                snapshot = inspect_candidate(client, state, open_item)
-                if is_terminal_turn_snapshot(snapshot):
-                    state.get("open_commands", {}).pop(open_item["key"], None)
-                    state.get("alerts", {}).pop(open_item["key"], None)
-                    continue
-                analysis = classify_runtime(open_item, snapshot, settings)
-                if analysis["level"] not in {"high_confidence_stuck", "hard_timeout_review"}:
-                    continue
-                popup_result = maybe_emit_user_popup(state, open_item, snapshot, analysis, settings)
-                alert_result = maybe_send_guardian_alert(client, layout, state, open_item, snapshot, analysis, settings)
-                interrupt_result = {"sent": False, "reason": "interrupt_mode_disabled"}
-                if effective_action_mode(settings) == "interrupt":
-                    decision = alert_result.get("decision") or {}
-                    action_taken = str(decision.get("action_taken", "")).lower()
-                    success_actions = {"succeeded", "killed", "terminated", "completed"}
-                    interrupt_result = {
-                        "sent": action_taken in success_actions,
-                        "reason": action_taken or "guardian_no_action",
-                        "decision": decision,
-                        "guardian_turn_id": alert_result.get("guardian_turn_id"),
-                    }
+    for open_item in list(state.get("open_commands", {}).values()):
+        try:
+            state["last_run_candidate_key"] = open_item["key"]
+            state["last_run_stage"] = "transcript_completion_check"
+            save_state(layout, state)
+            transcript_match = find_matching_transcript_call(open_item.get("transcript_path"), open_item)
+            if transcript_match and is_terminal_turn_snapshot(transcript_match):
+                state.get("open_commands", {}).pop(open_item["key"], None)
+                state.get("alerts", {}).pop(open_item["key"], None)
+                continue
+            state["last_run_stage"] = "coarse_hard_timeout_check"
+            save_state(layout, state)
+            # B threshold must not wait for app-server or process inspection.
+            coarse_snapshot = resolve_thread_label_bounded(state, open_item)
+            coarse_analysis = classify_runtime(open_item, coarse_snapshot, settings)
+            if coarse_analysis["level"] == "hard_timeout_review":
+                should_record = should_record_alert(state, open_item, coarse_analysis)
+                popup_result = maybe_emit_user_popup(state, open_item, coarse_snapshot, coarse_analysis, settings)
+                alert_result = send_guardian_alert_bounded(
+                    layout, state, open_item, coarse_snapshot, coarse_analysis, settings
+                )
                 payload = {
                     "observed_at": utc_now_iso(),
                     "open_item": open_item,
-                    "snapshot": snapshot,
-                    "analysis": analysis,
+                    "snapshot": coarse_snapshot,
+                    "analysis": coarse_analysis,
                     "user_notification": popup_result,
                     "guardian_delivery": alert_result,
-                    "interrupt_delivery": interrupt_result,
+                    "interrupt_delivery": {"sent": False, "reason": "hard_timeout_review_only"},
                 }
+                if should_record or popup_result.get("sent") or alert_result.get("sent"):
+                    day = utc_now_iso()[:10]
+                    append_jsonl(layout.alerts_dir / f"alerts-{day}.jsonl", payload)
+                    mark_alert_recorded(state, open_item, coarse_analysis)
+                    results["alerts"].append(payload)
+                continue
+            state["last_run_stage"] = "bounded_deep_check"
+            save_state(layout, state)
+            snapshot = inspect_candidate_bounded(
+                state, open_item, settings["watchdog"]["deep_check_timeout_seconds"]
+            )
+            if is_terminal_turn_snapshot(snapshot):
+                state.get("open_commands", {}).pop(open_item["key"], None)
+                state.get("alerts", {}).pop(open_item["key"], None)
+                continue
+            analysis = classify_runtime(open_item, snapshot, settings)
+            if analysis["level"] not in {"high_confidence_stuck", "hard_timeout_review"}:
+                continue
+            should_record = should_record_alert(state, open_item, analysis)
+            state["last_run_stage"] = "dispatching_alert"
+            save_state(layout, state)
+            popup_result = maybe_emit_user_popup(state, open_item, snapshot, analysis, settings)
+            alert_result = send_guardian_alert_bounded(layout, state, open_item, snapshot, analysis, settings)
+            interrupt_result = {"sent": False, "reason": "interrupt_mode_disabled"}
+            if effective_action_mode(settings) == "interrupt":
+                decision = alert_result.get("decision") or {}
+                action_taken = str(decision.get("action_taken", "")).lower()
+                success_actions = {"succeeded", "killed", "terminated", "completed"}
+                interrupt_result = {
+                    "sent": action_taken in success_actions,
+                    "reason": action_taken or "guardian_no_action",
+                    "decision": decision,
+                    "guardian_turn_id": alert_result.get("guardian_turn_id"),
+                }
+            payload = {
+                "observed_at": utc_now_iso(),
+                "open_item": open_item,
+                "snapshot": snapshot,
+                "analysis": analysis,
+                "user_notification": popup_result,
+                "guardian_delivery": alert_result,
+                "interrupt_delivery": interrupt_result,
+            }
+            if should_record or popup_result.get("sent") or alert_result.get("sent") or interrupt_result.get("sent"):
                 day = utc_now_iso()[:10]
                 append_jsonl(layout.alerts_dir / f"alerts-{day}.jsonl", payload)
+                mark_alert_recorded(state, open_item, analysis)
                 results["alerts"].append(payload)
-                if interrupt_result.get("sent"):
-                    state.get("open_commands", {}).pop(open_item["key"], None)
-            except Exception as exc:
-                day = utc_now_iso()[:10]
-                append_jsonl(
-                    layout.logs_dir / f"watchdog-errors-{day}.jsonl",
-                    {
-                        "observed_at": utc_now_iso(),
-                        "open_item": open_item,
-                        "error": repr(exc),
-                    },
-                )
+            if interrupt_result.get("sent"):
+                state.get("open_commands", {}).pop(open_item["key"], None)
+        except Exception as exc:
+            day = utc_now_iso()[:10]
+            append_jsonl(
+                layout.logs_dir / f"watchdog-errors-{day}.jsonl",
+                {
+                    "observed_at": utc_now_iso(),
+                    "open_item": open_item,
+                    "error": repr(exc),
+                },
+            )
+    state["last_run_stage"] = "idle"
+    state["last_run_completed_at"] = utc_now_iso()
+    state.pop("last_run_candidate_key", None)
     save_state(layout, state)
     return results
 

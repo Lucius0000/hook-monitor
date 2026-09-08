@@ -30,6 +30,7 @@ class CodexAppServerClient:
     def __init__(self, timeout_seconds: int = 30) -> None:
         self.timeout_seconds = timeout_seconds
         self._stderr_lines: Queue[str] = Queue()
+        self._stdout_lines: Queue[str] = Queue()
         self._next_id = 1
         self._proc = subprocess.Popen(
             [resolve_codex_exe(), "app-server", "--stdio"],
@@ -42,8 +43,13 @@ class CodexAppServerClient:
         )
         if self._proc.stdin is None or self._proc.stdout is None or self._proc.stderr is None:
             raise AppServerError("Failed to start codex app-server stdio transport.")
+        threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
-        self.initialize()
+        try:
+            self.initialize()
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         if self._proc.poll() is None:
@@ -60,15 +66,22 @@ class CodexAppServerClient:
         for line in self._proc.stderr:
             self._stderr_lines.put(line.rstrip())
 
+    def _drain_stdout(self) -> None:
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            self._stdout_lines.put(line.rstrip())
+
     def _read_message(self, timeout_seconds: int | None = None) -> dict[str, Any]:
         deadline = time.time() + (timeout_seconds or self.timeout_seconds)
-        assert self._proc.stdout is not None
         while time.time() < deadline:
             if self._proc.poll() is not None:
                 raise AppServerError(f"app-server exited early: {self._proc.returncode}")
-            line = self._proc.stdout.readline()
-            if not line:
-                time.sleep(0.05)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                line = self._stdout_lines.get(timeout=min(remaining, 0.25))
+            except Empty:
                 continue
             try:
                 return json.loads(line)
@@ -165,4 +178,3 @@ class CodexAppServerClient:
 
     def turn_interrupt(self, thread_id: str, turn_id: str) -> dict[str, Any]:
         return self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
-
